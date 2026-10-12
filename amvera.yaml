@@ -1,0 +1,19 @@
+# Конфигурация для хостинга Amvera (https://amvera.ru).
+# Подробности: https://docs.amvera.ru/applications/environments/python-pip.html
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: 3.11
+
+build:
+  requirementsPath: requirements.txt
+
+run:
+  # точка входа — bot.py в корне проекта
+  scriptName: bot.py
+  # постоянное хранилище: файлы здесь НЕ стираются при обновлении проекта.
+  # именно сюда нужно сохранять data/mogbattle.db (см. переменную DB_PATH в config.py)
+  persistenceMount: /data
+  # для бота-опросчика (long polling) порт ни на что не влияет, но поле обязательное
+  containerPort: 80
