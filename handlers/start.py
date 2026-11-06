@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 
@@ -5,6 +6,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 import db
+from images_ny import render_welcome_card
 from keyboards import MAIN_MENU
 from handlers.common import ensure_registered
 from subscription import require_subscription
@@ -12,6 +14,20 @@ from subscription import require_subscription
 logger = logging.getLogger(__name__)
 
 CAPTION_LIMIT = 1024  # Telegram не даёт подпись к фото длиннее этого
+
+_banner_bytes = None  # новогодний баннер рисуется один раз и переиспользуется
+
+
+async def _welcome_photo():
+    """Фото приветствия: загруженное админом (file_id) или новогодний баннер — тогда
+    сначала пробуем file_id, который Telegram уже выдал, иначе рисуем картинку."""
+    global _banner_bytes
+    file_id = db.get_setting("welcome_photo_file_id", "") or db.get_setting("welcome_banner_file_id", "")
+    if file_id:
+        return file_id, False
+    if _banner_bytes is None:
+        _banner_bytes = (await asyncio.to_thread(render_welcome_card, 0)).getvalue()
+    return _banner_bytes, True
 
 
 def _fill_name(text: str, name: str, escaped: bool) -> str:
@@ -38,16 +54,24 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plain = _fill_name(db.get_setting("welcome_text", "Добро пожаловать в MOG BATTLE!"), name, False)
     rich = db.get_setting("welcome_html", "")
     rich = _fill_name(rich, name, True) if rich else ""
-    photo_id = db.get_setting("welcome_photo_file_id", "")
+    try:
+        photo_id, is_new = await _welcome_photo()
+    except Exception:
+        logger.exception("Не удалось подготовить карточку приветствия")
+        photo_id, is_new = "", False
 
     async def send(text: str, parse_mode):
         if photo_id and len(text) <= CAPTION_LIMIT:
-            await update.message.reply_photo(
+            msg = await update.message.reply_photo(
                 photo=photo_id, caption=text, parse_mode=parse_mode, reply_markup=MAIN_MENU
             )
+            if is_new and msg.photo:  # запоминаем file_id — следующим людям уйдёт мгновенно
+                db.set_setting("welcome_banner_file_id", msg.photo[-1].file_id)
             return
         if photo_id:  # текст длиннее лимита подписи — фото и текст отдельно
-            await update.message.reply_photo(photo=photo_id)
+            msg = await update.message.reply_photo(photo=photo_id)
+            if is_new and msg.photo:
+                db.set_setting("welcome_banner_file_id", msg.photo[-1].file_id)
         await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=MAIN_MENU)
 
     if rich:

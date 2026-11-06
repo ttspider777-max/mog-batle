@@ -11,7 +11,7 @@ from subscription import require_subscription
 def me_keyboard(card_style: str):
     style = card_style or "neon"
     classic_label = "⚪ Classic ✅" if style == "classic" else "⚪ Classic"
-    neon_label = "⚡ Neon ✅" if style == "neon" else "⚡ Neon"
+    neon_label = "🎄 New Year ✅" if style == "neon" else "🎄 New Year"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Изменить статус", callback_data="me:edit_status")],
         [
@@ -24,7 +24,7 @@ def me_keyboard(card_style: str):
 def _profile_text(row: dict, stats: dict) -> str:
     rank = db.user_rank(row["user_id"])
     status = html.escape(row.get("custom_status") or "не указан")
-    style = "⚡ Neon" if (row.get("card_style") or "neon") == "neon" else "⚪ Classic"
+    style = "🎄 New Year" if (row.get("card_style") or "neon") == "neon" else "⚪ Classic"
     return (
         f"👤 <b>{html.escape(display_name(row))}</b>\n\n"
         f"⭐ Рейтинг (LTN): <b>{row['rating']:.2f}</b>\n"

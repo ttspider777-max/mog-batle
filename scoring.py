@@ -69,9 +69,10 @@ TIERS = [
     (3.00, "SUB 5", "🥉"),
     (5.00, "LTN", "🙂"),
     (6.50, "MTN", "😎"),
-    (7.50, "HTN", "🔥"),
-    (8.50, "CHAD", "🗿"),
-    (9.50, "TRUE ADAM", "👑"),
+    (7.00, "HTN", "🔥"),
+    (8.00, "CHADLITE", "😼"),
+    (9.00, "CHAD", "🗿"),
+    (9.60, "TRUE ADAM", "👑"),
 ]
 
 
@@ -92,10 +93,29 @@ def tier_emoji(rating: float) -> str:
     return _tier(rating)[2]
 
 
+def verdict(score: float) -> str:
+    if score >= 9:
+        return "топ"
+    if score >= 7.5:
+        return "отлично"
+    if score >= 6:
+        return "хорошо"
+    if score >= 4:
+        return "норм"
+    return "слабо"
+
+
+def total_score(categories) -> float:
+    """Итоговый балл профиля — среднее по всем категориям (0-10). Именно он решает, кто
+    победил в баттле."""
+    return round(sum(c[2] for c in categories) / len(categories), 2)
+
+
 def avatar_score(photo_count: int):
     if photo_count <= 0:
         return 0.0, "нет фото"
-    return _clamp(5.0 + min(photo_count, 5) * 0.98), f"{photo_count} фото"
+    score = _clamp(4.5 + min(photo_count, 10) * 0.54)
+    return score, f"{photo_count} фото · {verdict(score)}"
 
 
 def username_score(username: str):
@@ -105,14 +125,14 @@ def username_score(username: str):
     letters_only = username.replace("_", "").isalpha()
     # короткий "красивый" ник ценится выше длинного с цифрами
     base = 10.0 - max(0, length - 4) * 0.35 + (0.4 if letters_only else -0.6)
-    subtitle = f"{length} симв. · {'слово' if letters_only else 'с цифрами'}"
+    subtitle = f"{length} букв · {'слово' if letters_only else 'с цифрами'}"
     return _clamp(max(2.0, base)), subtitle
 
 
 def bio_score(bio: str):
     if not bio:
         return 0.0, "пусто"
-    return _clamp(4.0 + len(bio) * 0.1), f"{len(bio)} симв."
+    return _clamp(3.5 + len(bio) * 0.09), f"{len(bio)} симв."
 
 
 def gifts_score(gifts_total: int, nft_count: int):

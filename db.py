@@ -122,6 +122,8 @@ def init_db():
                     "INSERT INTO settings (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value)
                 )
+            # новая ревизия приветствия = новая карточка: старое фото из админки сбрасываем
+            conn.execute("DELETE FROM settings WHERE key IN ('welcome_photo_file_id', 'welcome_banner_file_id')")
 
 
 # ---------- Пользователи ----------

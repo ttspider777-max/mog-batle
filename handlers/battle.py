@@ -1,7 +1,6 @@
 import asyncio
 import html
 import logging
-import random
 import re
 import time
 
@@ -11,7 +10,7 @@ from telegram.ext import ContextTypes
 import db
 import scoring
 from images import render_challenge_card
-from images_neon import render_challenge_card_neon
+from images_ny import render_challenge_card_ny
 from images_result import render_detailed_result_card
 from keyboards import challenge_keyboard, result_keyboard, rematch_keyboard, inline_challenge_keyboard
 from handlers.common import ensure_registered, get_avatar_bytes, get_tg_stats, display_name
@@ -27,15 +26,18 @@ USERNAME_RE = re.compile(r"^@([A-Za-z0-9_]{4,32})$")
 
 # ---------- Карточка вызова ----------
 
-async def _render_challenge(context, row: dict):
+async def _render_challenge(context, row: dict, seed=None, target_name=None):
     avatar = await get_avatar_bytes(context, row["user_id"])
     challenger = {
         "name": row["first_name"] or "Игрок",
         "username": row["username"] or "",
         "rating": row["rating"],
     }
-    if (row.get("card_style") or "neon") == "neon":
-        return await asyncio.to_thread(render_challenge_card_neon, challenger, avatar)
+    if (row.get("card_style") or "neon") != "classic":
+        # «neon» — это теперь новогодний стиль; тема зависит от seed (ID баттла / игрока)
+        return await asyncio.to_thread(
+            render_challenge_card_ny, challenger, avatar,
+            row["user_id"] if seed is None else seed, target_name)
     return await asyncio.to_thread(render_challenge_card, challenger, avatar)
 
 
@@ -44,7 +46,7 @@ async def _card_file_id(context, row: dict):
     только уже загруженное в Telegram фото, поэтому карточка один раз загружается в личку
     игрока (и сразу удаляется оттуда), а file_id кэшируется, пока не поменяются рейтинг,
     ник или дизайн. Возвращает None, если человек ни разу не запускал бота."""
-    key = f"{row.get('card_style') or 'neon'}|{row['rating']:.2f}|{row['username']}|{row['first_name']}"
+    key = f"ny2|{row.get('card_style') or 'neon'}|{row['rating']:.2f}|{row['username']}|{row['first_name']}"
     if row.get("card_file_id") and row.get("card_key") == key:
         return row["card_file_id"]
     try:
@@ -71,9 +73,13 @@ async def _post_challenge(update: Update, context, row: dict, target_row=None, t
         target_id=target_row["user_id"] if target_row else None,
         target_username=None if target_row else target_username,
     )
-    photo_buf = await _render_challenge(context, row)
     private = update.effective_chat.type == "private"
     name = display_name(row)
+    photo_buf = await _render_challenge(
+        context, row, seed=battle_id,
+        target_name=(display_name(target_row) if target_row else
+                     (f"@{target_username}" if target_username else None)),
+    )
 
     if target_row or target_username:
         target_name = display_name(target_row) if target_row else f"@{target_username}"
@@ -168,7 +174,7 @@ async def _instant_battle(update: Update, context, challenger_row: dict, opp_use
     battle_id = db.create_battle(challenger_row["user_id"], target_id=opponent_row["user_id"])
     db.claim_battle(battle_id, opponent_row["user_id"])
 
-    caption, _winner_id, card_args = resolve_battle(battle_id, challenger_row, opponent_row)
+    caption, _winner_id, card_args = await resolve_battle(context, battle_id, challenger_row, opponent_row)
     msg = await update.message.reply_text(
         caption, parse_mode="HTML", reply_markup=result_keyboard(battle_id)
     )
@@ -362,7 +368,7 @@ async def _accept(update: Update, context: ContextTypes.DEFAULT_TYPE, battle: di
     await query.answer("⚔️ Вызов принят! Считаю результат…")
 
     try:
-        caption, winner_id, card_args = resolve_battle(battle_id, challenger_row, opponent_row)
+        caption, winner_id, card_args = await resolve_battle(context, battle_id, challenger_row, opponent_row)
     except Exception:
         # не оставляем людей с вечным "считаю результат" — пишем прямо в карточке
         try:
@@ -444,7 +450,8 @@ async def _attach_result_card(context, query, battle_id, caption, challenger_row
     return opponent_notified
 
 
-def _result_caption(winner_row, loser_row, w_old, w_new, l_old, l_new, w_streak, l_lost_streak):
+def _result_caption(winner_row, loser_row, w_old, w_new, l_old, l_new, w_streak, l_lost_streak,
+                    w_score=None, l_score=None):
     w_name = html.escape(display_name(winner_row))
     l_name = html.escape(display_name(loser_row))
     w_tier, l_tier = scoring.tier_label(w_new), scoring.tier_label(l_new)
@@ -468,16 +475,44 @@ def _result_caption(winner_row, loser_row, w_old, w_new, l_old, l_new, w_streak,
         f"├ Рейтинг: {l_old:.2f} → <b>{l_new:.2f}</b> ({l_new - l_old:+.2f})\n"
         f"└ {l_streak_line}\n\n"
         f"⚔️ <b>{w_name}</b> могнул <b>{l_name}</b>"
+        + (f"\n📊 Счёт по профилям: <b>{w_score:.2f}</b> : {l_score:.2f}" if w_score is not None else "")
     )
 
 
-def resolve_battle(battle_id: int, challenger_row: dict, opponent_row: dict):
-    """Определяет победителя, обновляет рейтинг и готовит текст результата.
-    Быстрая операция (только база) — картинку рисует _build_result_card(*card_args).
-    Возвращает (подпись HTML, id победителя, card_args)."""
-    # победитель — случайно, но с учётом рейтинга (более высокий рейтинг — выше шанс)
-    p_challenger_wins = db.win_probability(challenger_row["rating"], opponent_row["rating"])
-    winner_is_challenger = random.random() < p_challenger_wins
+async def _profile_dict(context, row: dict, rating_for_tag=None) -> dict:
+    """Настоящая статистика профиля Telegram → категории и итоговый балл."""
+    stats = await get_tg_stats(context, row["user_id"])
+    categories = scoring.compute_categories(
+        row["user_id"], row["username"], stats, bool(row.get("is_premium")),
+        custom_status=row.get("custom_status"),
+    )
+    total = scoring.total_score(categories)
+    return {
+        "user_id": row["user_id"],
+        "display_name": display_name(row),
+        "username": row["username"] or "",
+        "avatar": stats["avatar"],
+        "categories": categories,
+        "total": total,
+        "tag": scoring.tier_label(total),
+        "streak": 0,
+    }
+
+
+async def resolve_battle(context, battle_id: int, challenger_row: dict, opponent_row: dict):
+    """Считает баллы обоих профилей по настоящим данным Telegram, определяет победителя
+    (у кого итоговый балл выше; при равенстве — у кого выше рейтинг), обновляет рейтинг и
+    готовит текст результата. Возвращает (подпись HTML, id победителя, card_args)."""
+    ch, op = await asyncio.gather(
+        _profile_dict(context, challenger_row), _profile_dict(context, opponent_row)
+    )
+    if ch["total"] != op["total"]:
+        winner_is_challenger = ch["total"] > op["total"]
+    elif challenger_row["rating"] != opponent_row["rating"]:
+        winner_is_challenger = challenger_row["rating"] > opponent_row["rating"]
+    else:
+        winner_is_challenger = challenger_row["user_id"] < opponent_row["user_id"]
+
     winner_row = challenger_row if winner_is_challenger else opponent_row
     loser_row = opponent_row if winner_is_challenger else challenger_row
     winner_id, loser_id = winner_row["user_id"], loser_row["user_id"]
@@ -487,60 +522,28 @@ def resolve_battle(battle_id: int, challenger_row: dict, opponent_row: dict):
     db.finish_battle(battle_id, opponent_row["user_id"], winner_id)
     winner_streak = db.win_streak(winner_id)
 
-    challenger_rating = new_winner_rating if winner_is_challenger else new_loser_rating
-    opponent_rating = new_loser_rating if winner_is_challenger else new_winner_rating
-
+    w_p, l_p = (ch, op) if winner_is_challenger else (op, ch)
     caption = _result_caption(
         winner_row, loser_row, winner_row["rating"], new_winner_rating,
         loser_row["rating"], new_loser_rating, winner_streak, loser_lost_streak,
+        w_p["total"], l_p["total"],
     )
-    card_args = (challenger_row, opponent_row, challenger_rating, opponent_rating,
-                 winner_is_challenger)
-    return caption, winner_id, card_args
-
-
-async def _build_result_card(context, challenger_row, opponent_row, challenger_rating,
-                             opponent_rating, winner_is_challenger) -> bytes:
-    # собираем НАСТОЯЩУЮ статистику обоих профилей (фото, био, уровень, подарки) —
-    # запросы к Telegram идут параллельно, так карточка готовится заметно быстрее.
-    challenger_stats, opponent_stats = await asyncio.gather(
-        get_tg_stats(context, challenger_row["user_id"]),
-        get_tg_stats(context, opponent_row["user_id"]),
-    )
-
-    challenger_categories = scoring.compute_categories(
-        challenger_row["user_id"], challenger_row["username"], challenger_stats,
-        bool(challenger_row.get("is_premium")),
-        custom_status=challenger_row.get("custom_status"),
-    )
-    opponent_categories = scoring.compute_categories(
-        opponent_row["user_id"], opponent_row["username"], opponent_stats,
-        bool(opponent_row.get("is_premium")),
-        custom_status=opponent_row.get("custom_status"),
-    )
-
-    challenger_dict = {
-        "display_name": display_name(challenger_row),
-        "username": challenger_row["username"] or "",
-        "rating": challenger_rating,
-        "avatar": challenger_stats["avatar"],
-        "tag": scoring.tier_label(challenger_rating),
-        "categories": challenger_categories,
+    ch["streak"] = winner_streak if winner_is_challenger else 0
+    op["streak"] = 0 if winner_is_challenger else winner_streak
+    payload = {
+        "battle_id": battle_id,
+        "left": ch, "right": op,
+        "winner_side": "left" if winner_is_challenger else "right",
     }
-    opponent_dict = {
-        "display_name": display_name(opponent_row),
-        "username": opponent_row["username"] or "",
-        "rating": opponent_rating,
-        "avatar": opponent_stats["avatar"],
-        "tag": scoring.tier_label(opponent_rating),
-        "categories": opponent_categories,
-    }
+    return caption, winner_id, (payload,)
 
-    winner_side = "left" if winner_is_challenger else "right"
+
+async def _build_result_card(context, payload) -> bytes:
     # рисование картинки — тяжёлая CPU-операция; уносим её в отдельный поток,
-    # чтобы она не блокировала обработку остальных сообщений бота, пока считается.
+    # чтобы она не блокировала обработку остальных сообщений бота.
     result_buf = await asyncio.to_thread(
-        render_detailed_result_card, challenger_dict, opponent_dict, winner_side
+        render_detailed_result_card, payload["left"], payload["right"],
+        payload["winner_side"], payload["battle_id"],
     )
     return result_buf.getvalue()
 
