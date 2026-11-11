@@ -8,7 +8,10 @@ from telegram.ext import ContextTypes
 import db
 import subscription
 from config import ADMIN_IDS
-from keyboards import admin_menu_keyboard, admin_cancel_keyboard, challenge_keyboard
+from keyboards import (
+    admin_menu_keyboard, admin_cancel_keyboard, challenge_keyboard, admin_season_keyboard,
+    admin_season_confirm_keyboard,
+)
 from images import render_challenge_card, render_result_card
 from handlers.common import display_name, get_avatar_bytes
 
@@ -17,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # меняй при каждом обновлении — видно в /admin, так легко понять, что Amvera
 # действительно запустила новую версию, а не старую
-BOT_VERSION = "2026-09-27 v5"
+BOT_VERSION = "2026-11-11 v6 seasons"
 
 
 def is_admin(user_id: int) -> bool:
@@ -63,6 +66,16 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _show_season_panel(query):
+    from handlers.season import season_text
+    season = db.active_season()
+    nxt = db.next_season_number()
+    await query.edit_message_text(
+        season_text(), parse_mode="HTML",
+        reply_markup=admin_season_keyboard(active=bool(season), can_start=nxt is not None),
+    )
+
+
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_admin(update.effective_user.id):
@@ -74,6 +87,55 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "cancel":
         db.set_admin_state(update.effective_user.id, "")
         await query.edit_message_text("Отменено.")
+        return
+
+    if action == "back":
+        await query.answer()
+        await query.edit_message_text("🛠 Админ-панель MOG BATTLE", reply_markup=admin_menu_keyboard())
+        return
+
+    if action == "season":
+        await query.answer()
+        await _show_season_panel(query)
+        return
+
+    if action == "season_start":
+        if db.next_season_number() is None:
+            await query.answer("Запустить сезон сейчас нельзя", show_alert=True)
+            return
+        db.set_admin_state(update.effective_user.id, "awaiting_season_prize")
+        await query.answer()
+        await query.edit_message_text(
+            f"Запускаем сезон {db.next_season_number()}.\n\nПришли описание приза для победителя "
+            f"(например: название NFT или ссылку) — оно покажется игрокам. "
+            f"Если приз пока не выбран — пришли «-».",
+            reply_markup=admin_cancel_keyboard(),
+        )
+        return
+
+    if action == "season_end":
+        season = db.active_season()
+        if not season:
+            await query.answer("Сейчас нет активного сезона", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            f"Завершить сезон {season['number']}? Победитель определится по очкам, итоги уйдут "
+            f"всем игрокам. Отменить это нельзя.",
+            reply_markup=admin_season_confirm_keyboard(),
+        )
+        return
+
+    if action == "season_end_yes":
+        season = db.active_season()
+        if not season:
+            await query.answer("Сезон уже завершён", show_alert=True)
+            return
+        await query.answer("Завершаю…")
+        await query.edit_message_text("⏳ Завершаю сезон и рассылаю итоги…")
+        from handlers.season import finish_and_announce
+        summary = await finish_and_announce(context, season)
+        await query.edit_message_text(summary, parse_mode="HTML")
         return
 
     if action == "stats":
@@ -167,6 +229,31 @@ async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Пришли текст или фото с подписью.")
             return True
         db.set_admin_state(admin_id, "")
+        return True
+
+    if state == "awaiting_season_prize":
+        prize = (message.text or "").strip()
+        db.set_admin_state(admin_id, "")
+        if prize == "-":
+            prize = ""
+        season = db.start_season(prize)
+        if not season:
+            await message.reply_text("Не получилось запустить сезон (уже идёт другой или все сыграны).")
+            return True
+        await message.reply_text(
+            f"✅ Сезон {season['number']} запущен! Очки начисляются за победы в «мог» и за «мог» в чатах."
+        )
+        # сообщаем игрокам
+        text = (f"🏅 Стартовал сезон {season['number']} MOG BATTLE!\n"
+                f"Побеждай соперников, пиши «мог» в чатах — победитель сезона получает NFT.\n"
+                f"Таблица и правила: /season")
+        if prize:
+            text += f"\n🎁 Приз: {prize}"
+        for uid in db.all_user_ids():
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+            except Exception:
+                pass
         return True
 
     if state == "awaiting_broadcast":

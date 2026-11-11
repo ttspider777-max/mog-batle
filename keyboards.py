@@ -4,7 +4,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["⚔️ Бросить вызов"],
         ["👤 Мой профиль", "🏆 Рейтинг"],
-        ["🔒 Приватность"],
+        ["🏅 Сезон", "🔒 Приватность"],
     ],
     resize_keyboard=True
 )
@@ -56,7 +56,25 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("📨 Разослать баттл в чат", callback_data="admin:send_battle")],
         [InlineKeyboardButton("🏆 Рейтинг игроков", callback_data="admin:leaderboard")],
         [InlineKeyboardButton("📢 Обязательная подписка", callback_data="admin:set_required_channel")],
+        [InlineKeyboardButton("🏅 Сезон", callback_data="admin:season")],
     ])
+
+
+def admin_season_keyboard(active: bool, can_start: bool):
+    rows = []
+    if active:
+        rows.append([InlineKeyboardButton("🏁 Завершить сезон", callback_data="admin:season_end")])
+    elif can_start:
+        rows.append([InlineKeyboardButton("▶️ Начать сезон", callback_data="admin:season_start")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_season_confirm_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, завершить", callback_data="admin:season_end_yes"),
+        InlineKeyboardButton("❌ Нет", callback_data="admin:season"),
+    ]])
 
 
 def admin_cancel_keyboard():

@@ -130,6 +130,16 @@ async def mog_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     m = MOG_RE.match(text)
     if not m:
         return False
+    # сезон: очко за «мог» в групповом чате (в личке с ботом очки не даются)
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat and chat.type in ("group", "supergroup") and user and not user.is_bot:
+        try:
+            _row, banned = await ensure_registered(update, context)
+            if not banned:
+                db.award_chat_point(user.id)
+        except Exception:
+            logger.exception("Не удалось начислить очко сезона за «мог»")
     await mog(update, context, m.group(1))
     return True
 
@@ -451,7 +461,7 @@ async def _attach_result_card(context, query, battle_id, caption, challenger_row
 
 
 def _result_caption(winner_row, loser_row, w_old, w_new, l_old, l_new, w_streak, l_lost_streak,
-                    w_score=None, l_score=None):
+                    w_score=None, l_score=None, season=None, season_pts=0):
     w_name = html.escape(display_name(winner_row))
     l_name = html.escape(display_name(loser_row))
     w_tier, l_tier = scoring.tier_label(w_new), scoring.tier_label(l_new)
@@ -476,7 +486,14 @@ def _result_caption(winner_row, loser_row, w_old, w_new, l_old, l_new, w_streak,
         f"└ {l_streak_line}\n\n"
         f"⚔️ <b>{w_name}</b> могнул <b>{l_name}</b>"
         + (f"\n📊 Счёт по профилям: <b>{w_score:.2f}</b> : {l_score:.2f}" if w_score is not None else "")
+        + (_season_line(w_name, season, season_pts) if season else "")
     )
+
+
+def _season_line(w_name, season, pts) -> str:
+    if pts > 0:
+        return f"\n🏅 Сезон {season['number']}: <b>{w_name}</b> +{pts} очк."
+    return f"\n🏅 Сезон {season['number']}: очки не начислены (лимит побед над одним соперником за сутки)"
 
 
 async def _profile_dict(context, row: dict, rating_for_tag=None) -> dict:
@@ -486,15 +503,14 @@ async def _profile_dict(context, row: dict, rating_for_tag=None) -> dict:
         row["user_id"], row["username"], stats, bool(row.get("is_premium")),
         custom_status=row.get("custom_status"),
     )
-    total = scoring.total_score(categories)
     return {
         "user_id": row["user_id"],
         "display_name": display_name(row),
         "username": row["username"] or "",
         "avatar": stats["avatar"],
         "categories": categories,
-        "total": total,
-        "tag": scoring.tier_label(total),
+        "total": 0.0,
+        "tag": "",
         "streak": 0,
     }
 
@@ -506,7 +522,13 @@ async def resolve_battle(context, battle_id: int, challenger_row: dict, opponent
     ch, op = await asyncio.gather(
         _profile_dict(context, challenger_row), _profile_dict(context, opponent_row)
     )
-    if ch["total"] != op["total"]:
+    # оба профиля сравниваются по ОДИНАКОВОМУ набору категорий (теми, что известны у обоих):
+    # скрытые данные или сбой Telegram у одного игрока не превращаются в нули и не решают исход
+    ch["total"] = scoring.total_score(ch["categories"], op["categories"])
+    op["total"] = scoring.total_score(op["categories"], ch["categories"])
+    ch["tag"], op["tag"] = scoring.tier_label(ch["total"]), scoring.tier_label(op["total"])
+
+    if abs(ch["total"] - op["total"]) >= 0.01:
         winner_is_challenger = ch["total"] > op["total"]
     elif challenger_row["rating"] != opponent_row["rating"]:
         winner_is_challenger = challenger_row["rating"] > opponent_row["rating"]
@@ -518,15 +540,19 @@ async def resolve_battle(context, battle_id: int, challenger_row: dict, opponent
     winner_id, loser_id = winner_row["user_id"], loser_row["user_id"]
 
     loser_lost_streak = db.win_streak(loser_id)  # винстрик, который сейчас прервётся
+    # рейтинг «до» берём из базы, а не из устаревшей строки, которую передали в функцию
+    w_old = db.get_user(winner_id)["rating"]
+    l_old = db.get_user(loser_id)["rating"]
     new_winner_rating, new_loser_rating = db.apply_battle_result(winner_id, loser_id)
     db.finish_battle(battle_id, opponent_row["user_id"], winner_id)
     winner_streak = db.win_streak(winner_id)
+    season, season_pts = db.award_battle_points(winner_id, loser_id, winner_streak, w_old, l_old)
 
     w_p, l_p = (ch, op) if winner_is_challenger else (op, ch)
     caption = _result_caption(
-        winner_row, loser_row, winner_row["rating"], new_winner_rating,
-        loser_row["rating"], new_loser_rating, winner_streak, loser_lost_streak,
-        w_p["total"], l_p["total"],
+        winner_row, loser_row, w_old, new_winner_rating,
+        l_old, new_loser_rating, winner_streak, loser_lost_streak,
+        w_p["total"], l_p["total"], season, season_pts,
     )
     ch["streak"] = winner_streak if winner_is_challenger else 0
     op["streak"] = 0 if winner_is_challenger else winner_streak
@@ -534,6 +560,7 @@ async def resolve_battle(context, battle_id: int, challenger_row: dict, opponent
         "battle_id": battle_id,
         "left": ch, "right": op,
         "winner_side": "left" if winner_is_challenger else "right",
+        "season": season["number"] if season else None,
     }
     return caption, winner_id, (payload,)
 
@@ -543,7 +570,7 @@ async def _build_result_card(context, payload) -> bytes:
     # чтобы она не блокировала обработку остальных сообщений бота.
     result_buf = await asyncio.to_thread(
         render_detailed_result_card, payload["left"], payload["right"],
-        payload["winner_side"], payload["battle_id"],
+        payload["winner_side"], payload["battle_id"], payload.get("season"),
     )
     return result_buf.getvalue()
 

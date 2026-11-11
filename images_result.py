@@ -96,18 +96,18 @@ def _side_panel(img, box, user, is_winner, theme, note):
         ry = rows_top + i * row_h
         d.text((x0 + pad, ry), label, font=lf, fill=(255, 255, 255))
         d.text((x0 + pad, ry + 28), subtitle, font=sf2, fill=(190, 198, 214))
-        txt = f"{score:.2f}"
+        txt = "—" if score is None else f"{score:.2f}"
         tw = d.textlength(txt, font=scf)
         d.text((x1 - pad - tw, ry + 2), txt, font=scf, fill=(255, 255, 255))
         by = ry + row_h - 6
         ny.line_a(img, (x0 + pad, by), (x1 - pad, by), (255, 255, 255, 55), 4)
         d = ImageDraw.Draw(img)
-        frac = max(0.02, min(1.0, score / 10))
+        frac = max(0.02, min(1.0, (score or 0) / 10))
         fillc = theme["accent"] if is_winner else (225, 230, 240)
         d.line([(x0 + pad, by), (x0 + pad + (x1 - x0 - 2 * pad) * frac, by)], fill=fillc, width=4)
 
 
-def render_detailed_result_card(left, right, winner_side, seed=0):
+def render_detailed_result_card(left, right, winner_side, seed=0, season=None):
     """left / right: dict(display_name, username, total, avatar, tag, streak, categories).
     seed — ID баттла: по нему выбирается тема и подписи-«рукописи»."""
     theme = ny.pick_theme(seed)
@@ -122,7 +122,7 @@ def render_detailed_result_card(left, right, winner_side, seed=0):
     d = ImageDraw.Draw(img)
     ny.text_c(d, W / 2, 168, "DIVINE CARD", ny.font(20, 600), theme["accent"], tracking=14)
     sx = W - 44 if mirror else 44
-    for txt, fnt, col, yy in (("SEASON 4", ny.font(22, 800), theme["gold"], 74),
+    for txt, fnt, col, yy in ((f"SEASON {season}" if season else "MOG", ny.font(22, 800), theme["gold"], 74),
                               ("NEW YEAR EDITION", ny.font(13, 600), (210, 216, 232), 102)):
         tw = d.textlength(txt, font=fnt)
         d.text((sx - tw if mirror else sx, yy), txt, font=fnt, fill=col)

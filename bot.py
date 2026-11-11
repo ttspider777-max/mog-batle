@@ -19,6 +19,7 @@ from handlers.battle import (
 from handlers.admin import admin_command, admin_callback, admin_text_router, is_admin, clear_photo_command
 from handlers.me import me_command, me_callback, me_status_text_router
 from handlers.privacy import privacy_command
+from handlers.season import season_command
 from subscription import is_subscribed
 from keyboards import MAIN_MENU
 
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # меняется при каждом обновлении — по логу/сообщениям видно, что на хостинге новая версия
-BOT_VERSION = "2026-09-28 v2"
+BOT_VERSION = "2026-11-11 v3 seasons"
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -61,6 +62,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await me_command(update, context)
     elif text == "🏆 Рейтинг":
         await leaderboard_command(update, context)
+    elif text == "🏅 Сезон":
+        await season_command(update, context)
     elif text == "🔒 Приватность":
         await privacy_command(update, context)
     elif update.effective_user and is_admin(update.effective_user.id) \
@@ -157,6 +160,7 @@ def main():
     app.add_handler(CommandHandler("me", me_command))
     app.add_handler(CommandHandler("privacy", privacy_command))
     app.add_handler(CommandHandler("top", leaderboard_command))
+    app.add_handler(CommandHandler("season", season_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("clear_photo", clear_photo_command))
 

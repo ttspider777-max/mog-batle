@@ -105,13 +105,44 @@ def verdict(score: float) -> str:
     return "слабо"
 
 
-def total_score(categories) -> float:
-    """Итоговый балл профиля — среднее по всем категориям (0-10). Именно он решает, кто
-    победил в баттле."""
-    return round(sum(c[2] for c in categories) / len(categories), 2)
+# Вес категории в итоговом балле: подарки и их стоимость — самое «дорогое» в профиле,
+# остальное — поровну.
+WEIGHTS = {
+    "Аватар": 1.0,
+    "@username": 1.0,
+    "О себе": 1.0,
+    "Подарки": 1.5,
+    "Стоимость": 1.5,
+    "Регистрация": 1.0,
+    "Уровень TG": 1.0,
+}
 
 
-def avatar_score(photo_count: int):
+def known(categories):
+    """Категории, по которым данные РЕАЛЬНО получены (score не None)."""
+    return {c[0]: c[2] for c in categories if c[2] is not None}
+
+
+def total_score(categories, other=None) -> float:
+    """Итоговый балл профиля (0-10) — взвешенное среднее по категориям.
+
+    Категории без данных (Telegram не ответил / человек скрыл) НЕ считаются нулём — они
+    просто выпадают из подсчёта. Если передан `other` (категории соперника), считаем только
+    по категориям, известным у ОБОИХ: так оба игрока сравниваются по одинаковому набору,
+    и сбой Telegram у одного не даёт ему проигрыш. Именно этот балл решает, кто победил."""
+    mine = known(categories)
+    if other is not None:
+        theirs = known(other)
+        mine = {k: v for k, v in mine.items() if k in theirs}
+    if not mine:
+        return 0.0
+    wsum = sum(WEIGHTS.get(k, 1.0) for k in mine)
+    return round(sum(v * WEIGHTS.get(k, 1.0) for k, v in mine.items()) / wsum, 2)
+
+
+def avatar_score(photo_count):
+    if photo_count is None:
+        return None, "нет данных"
     if photo_count <= 0:
         return 0.0, "нет фото"
     score = _clamp(4.5 + min(photo_count, 10) * 0.54)
@@ -129,13 +160,17 @@ def username_score(username: str):
     return _clamp(max(2.0, base)), subtitle
 
 
-def bio_score(bio: str):
+def bio_score(bio, known=True):
+    if not known:
+        return None, "нет данных"
     if not bio:
         return 0.0, "пусто"
     return _clamp(3.5 + len(bio) * 0.09), f"{len(bio)} симв."
 
 
-def gifts_score(gifts_total: int, nft_count: int):
+def gifts_score(gifts_total, nft_count: int):
+    if gifts_total is None:
+        return None, "нет данных"
     if gifts_total <= 0:
         return 0.0, "нет подарков"
     subtitle = f"{gifts_total} шт"
@@ -144,10 +179,12 @@ def gifts_score(gifts_total: int, nft_count: int):
     return _clamp(2.0 + gifts_total * 0.5 + nft_count * 1.5), subtitle
 
 
-def value_score(stars_value: int, nft_count: int):
+def value_score(stars_value, nft_count: int):
     """Стоимость = сумма цен обычных подарков в звёздах. У NFT-подарков цены в API нет,
     поэтому они показываются отдельно (+N NFT) и дают бонус к баллу."""
     # "зв." вместо эмодзи звезды — в шрифте карточки (DejaVu) нет символа ⭐
+    if stars_value is None:
+        return None, "нет данных"
     if stars_value <= 0 and nft_count <= 0:
         return 0.0, "0 зв."
     subtitle = f"{stars_value:,} зв.".replace(",", " ")
@@ -156,11 +193,11 @@ def value_score(stars_value: int, nft_count: int):
     return _clamp(math.log10(stars_value + 1) * 2.5 + nft_count * 2.0), subtitle
 
 
-def tg_level_score(level, is_premium: bool):
-    """level — официальный уровень аккаунта Telegram (None, если скрыт)."""
-    if level is None:
-        subtitle = "скрыт · Premium" if is_premium else "скрыт"
-        return (3.5 if is_premium else 1.0), subtitle
+def tg_level_score(level, is_premium: bool, known=True):
+    """level — официальный уровень аккаунта Telegram. None = скрыт или не удалось
+    получить: это «нет данных», а не плохой уровень, поэтому в баллы не идёт."""
+    if level is None or not known:
+        return None, "скрыт · Premium" if is_premium else "скрыт"
     subtitle = f"Уровень {level}" + (" · Premium" if is_premium else "")
     return _clamp(2.0 + level * 0.4 + (1.5 if is_premium else 0)), subtitle
 
@@ -168,15 +205,18 @@ def tg_level_score(level, is_premium: bool):
 def compute_categories(user_id: int, username: str, stats: dict, is_premium: bool,
                        custom_status: str = None):
     """Возвращает список категорий в фиксированном порядке для карточки результата:
-    [(label, subtitle, score), ...]. stats — результат common.get_tg_stats().
+    [(label, subtitle, score|None), ...] (None — данных нет). stats — результат common.get_tg_stats().
     custom_status (заданный через /me) имеет приоритет над Telegram-био в «О себе»."""
     a_score, a_sub = avatar_score(stats["photo_count"])
     u_score, u_sub = username_score(username)
-    b_score, b_sub = bio_score(custom_status or stats["bio"])
+    if custom_status:
+        b_score, b_sub = bio_score(custom_status)
+    else:
+        b_score, b_sub = bio_score(stats["bio"], known=stats.get("bio_known", True))
     g_score, g_sub = gifts_score(stats["gifts_total"], stats["nft_count"])
     v_score, v_sub = value_score(stats["stars_value"], stats["nft_count"])
     r_sub, r_score = estimate_registration(user_id)
-    t_score, t_sub = tg_level_score(stats["level"], is_premium)
+    t_score, t_sub = tg_level_score(stats["level"], is_premium, known=stats.get("bio_known", True))
 
     return [
         ("Аватар", a_sub, a_score),

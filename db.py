@@ -13,7 +13,10 @@ import time
 import os
 from contextlib import contextmanager
 
-from config import DB_PATH, RATING_MIN, RATING_MAX, RATING_K
+from config import (
+    DB_PATH, RATING_K, SEASONS_TOTAL, POINTS_WIN, POINTS_UPSET, POINTS_STREAK_STEP,
+    POINTS_STREAK_MAX, POINTS_CHAT, CHAT_COOLDOWN, CHAT_DAILY_CAP, PAIR_DAILY_FULL,
+)
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -101,6 +104,30 @@ def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_battles_inline ON battles(inline_message_id)"
         )
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS seasons (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                number      INTEGER UNIQUE,      -- 1..SEASONS_TOTAL
+                prize       TEXT,                -- что получает победитель (NFT)
+                status      TEXT DEFAULT 'active',  -- active | finished
+                started_at  INTEGER,
+                ended_at    INTEGER,
+                winner_id   INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS season_points (
+                season_id     INTEGER,
+                user_id       INTEGER,
+                points        INTEGER DEFAULT 0,
+                wins          INTEGER DEFAULT 0,   -- сколько раз «могнул» соперника
+                chat_points   INTEGER DEFAULT 0,   -- очки за «мог» в чатах
+                last_chat_ts  INTEGER DEFAULT 0,
+                chat_day      TEXT,
+                chat_day_pts  INTEGER DEFAULT 0,
+                PRIMARY KEY (season_id, user_id)
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT
@@ -139,7 +166,7 @@ def get_or_create_user(user_id: int, username: str, first_name: str, is_premium:
             )
             row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
             return dict(row), False
-        rating = round(random.uniform(RATING_MIN, RATING_MAX), 2)
+        rating = 5.00  # нейтральный старт: дальше рейтинг двигают только честные победы
         conn.execute(
             "INSERT INTO users (user_id, username, first_name, rating, is_premium, joined_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -318,20 +345,19 @@ def last_battle_of(user_id: int):
 
 
 def apply_battle_result(winner_id: int, loser_id: int):
-    """Простое Elo-подобное обновление рейтинга по шкале 0-10."""
+    """Elo-обновление рейтинга по шкале 0-10. Изменение СИММЕТРИЧНО: сколько получил
+    победитель — столько потерял проигравший (раньше проигравший терял другую величину,
+    и рейтинги «уплывали»). Чем неожиданнее победа — тем больше сдвиг."""
     with get_conn() as conn:
         w = conn.execute("SELECT rating FROM users WHERE user_id=?", (winner_id,)).fetchone()
         l = conn.execute("SELECT rating FROM users WHERE user_id=?", (loser_id,)).fetchone()
         rw, rl = w["rating"], l["rating"]
 
-        expected_w = 1 / (1 + 10 ** ((rl - rw) / 4))
-        expected_l = 1 - expected_w
+        expected_w = win_probability(rw, rl)
+        delta = RATING_K * 2 * (1 - expected_w)
 
-        new_rw = rw + RATING_K * (1 - expected_w) * 2
-        new_rl = rl - RATING_K * (1 - expected_l) * 2
-
-        new_rw = max(0.01, min(9.99, round(new_rw, 2)))
-        new_rl = max(0.01, min(9.99, round(new_rl, 2)))
+        new_rw = max(0.01, min(9.99, round(rw + delta, 2)))
+        new_rl = max(0.01, min(9.99, round(rl - delta, 2)))
 
         conn.execute(
             "UPDATE users SET rating=?, wins=wins+1 WHERE user_id=?", (new_rw, winner_id)
@@ -377,3 +403,150 @@ def all_user_ids():
     with get_conn() as conn:
         rows = conn.execute("SELECT user_id FROM users WHERE banned=0").fetchall()
         return [r["user_id"] for r in rows]
+
+
+# ---------- Сезоны ----------
+
+def active_season():
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM seasons WHERE status='active' LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+
+def finished_seasons():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM seasons WHERE status='finished' ORDER BY number"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def next_season_number():
+    """Номер следующего сезона или None, если все SEASONS_TOTAL уже сыграны / идёт текущий."""
+    with get_conn() as conn:
+        if conn.execute("SELECT 1 FROM seasons WHERE status='active'").fetchone():
+            return None
+        last = conn.execute("SELECT MAX(number) m FROM seasons").fetchone()["m"] or 0
+        return last + 1 if last < SEASONS_TOTAL else None
+
+
+def start_season(prize: str = ""):
+    """Запускает следующий сезон. Возвращает его dict или None, если запустить нельзя."""
+    number = next_season_number()
+    if number is None:
+        return None
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO seasons (number, prize, status, started_at) VALUES (?, ?, 'active', ?)",
+                (number, prize or "", int(time.time()))
+            )
+    except sqlite3.IntegrityError:
+        return None
+    return active_season()
+
+
+def season_standings(season_id: int, limit: int = 10):
+    """Таблица сезона: очки, затем число побед, затем рейтинг."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT u.*, sp.points AS season_points, sp.wins AS season_wins, "
+            "sp.chat_points AS season_chat FROM season_points sp "
+            "JOIN users u ON u.user_id = sp.user_id "
+            "WHERE sp.season_id=? AND u.banned=0 AND sp.points>0 "
+            "ORDER BY sp.points DESC, sp.wins DESC, u.rating DESC LIMIT ?",
+            (season_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def season_place(season_id: int, user_id: int):
+    """(место, очки, победы) игрока в сезоне или None, если очков ещё нет."""
+    with get_conn() as conn:
+        me = conn.execute(
+            "SELECT points, wins FROM season_points WHERE season_id=? AND user_id=?",
+            (season_id, user_id)
+        ).fetchone()
+        if not me or me["points"] <= 0:
+            return None
+        ahead = conn.execute(
+            "SELECT COUNT(*) c FROM season_points sp JOIN users u ON u.user_id=sp.user_id "
+            "WHERE sp.season_id=? AND u.banned=0 AND (sp.points > ? OR (sp.points = ? AND sp.wins > ?))",
+            (season_id, me["points"], me["points"], me["wins"])
+        ).fetchone()["c"]
+        return ahead + 1, me["points"], me["wins"]
+
+
+def finish_season(season_id: int):
+    """Закрывает сезон и определяет победителя. Возвращает (winner_row|None, top3)."""
+    top = season_standings(season_id, 3)
+    winner = top[0] if top else None
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE seasons SET status='finished', ended_at=?, winner_id=? WHERE id=?",
+            (int(time.time()), winner["user_id"] if winner else None, season_id)
+        )
+    return winner, top
+
+
+def _pair_wins_today(conn, winner_id: int, loser_id: int) -> int:
+    day_start = int(time.time()) - 24 * 3600
+    return conn.execute(
+        "SELECT COUNT(*) c FROM battles WHERE status='done' AND winner_id=? "
+        "AND ((challenger_id=? AND opponent_id=?) OR (challenger_id=? AND opponent_id=?)) "
+        "AND COALESCE(finished_at, created_at) >= ?",
+        (winner_id, winner_id, loser_id, loser_id, winner_id, day_start)
+    ).fetchone()["c"]
+
+
+def award_battle_points(winner_id: int, loser_id: int, winner_streak: int, winner_old_rating: float,
+                        loser_old_rating: float):
+    """Очки сезона за победу в «моге» (проигравший очков не получает).
+    База + бонус за победу над более высоким рейтингом + бонус за винстрик.
+    Защита от накрутки: победы над одним и тем же соперником дают очки только первые
+    PAIR_DAILY_FULL раз за последние сутки. Возвращает (season, очки) или (None, 0)."""
+    season = active_season()
+    if not season:
+        return None, 0
+    with get_conn() as conn:
+        # текущий баттл уже записан как done, поэтому он входит в счётчик
+        if _pair_wins_today(conn, winner_id, loser_id) > PAIR_DAILY_FULL:
+            return season, 0
+        pts = POINTS_WIN
+        if loser_old_rating > winner_old_rating:
+            pts += POINTS_UPSET
+        pts += min(max(0, winner_streak - 1) * POINTS_STREAK_STEP, POINTS_STREAK_MAX)
+        conn.execute(
+            "INSERT INTO season_points (season_id, user_id, points, wins) VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(season_id, user_id) DO UPDATE SET points=points+?, wins=wins+1",
+            (season["id"], winner_id, pts, pts)
+        )
+    return season, pts
+
+
+def award_chat_point(user_id: int) -> int:
+    """Очко за «мог» в группе. Раз в CHAT_COOLDOWN секунд и не больше CHAT_DAILY_CAP в сутки.
+    Возвращает начисленные очки (0 — нельзя / нет активного сезона)."""
+    season = active_season()
+    if not season:
+        return 0
+    now = int(time.time())
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO season_points (season_id, user_id) VALUES (?, ?)",
+            (season["id"], user_id)
+        )
+        row = conn.execute(
+            "SELECT last_chat_ts, chat_day, chat_day_pts FROM season_points "
+            "WHERE season_id=? AND user_id=?", (season["id"], user_id)
+        ).fetchone()
+        day_pts = row["chat_day_pts"] if row["chat_day"] == today else 0
+        if now - (row["last_chat_ts"] or 0) < CHAT_COOLDOWN or day_pts + POINTS_CHAT > CHAT_DAILY_CAP:
+            return 0
+        conn.execute(
+            "UPDATE season_points SET points=points+?, chat_points=chat_points+?, "
+            "last_chat_ts=?, chat_day=?, chat_day_pts=? WHERE season_id=? AND user_id=?",
+            (POINTS_CHAT, POINTS_CHAT, now, today, day_pts + POINTS_CHAT, season["id"], user_id)
+        )
+        return POINTS_CHAT
